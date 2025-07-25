@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import os
 import time
+from datetime import datetime
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, Union, cast
@@ -20,6 +21,7 @@ from azure.core.exceptions import ResourceNotFoundError
 from azure.identity.aio import (
     AzureDeveloperCliCredential,
     ManagedIdentityCredential,
+    ClientSecretCredential,
     get_bearer_token_provider,
 )
 from azure.monitor.opentelemetry import configure_azure_monitor
@@ -85,12 +87,14 @@ from config import (
     CONFIG_SPEECH_SERVICE_LOCATION,
     CONFIG_SPEECH_SERVICE_TOKEN,
     CONFIG_SPEECH_SERVICE_VOICE,
+    CONFIG_SHAREPOINT_BASE_URL,
     CONFIG_STREAMING_ENABLED,
     CONFIG_USER_BLOB_CONTAINER_CLIENT,
     CONFIG_USER_UPLOAD_ENABLED,
     CONFIG_VECTOR_SEARCH_ENABLED,
 )
 from core.authentication import AuthenticationHelper
+from core.init_bot import init_bot_context, validate_runtime_status
 from core.sessionhelper import create_session_id
 from decorators import authenticated, authenticated_path
 from error import error_dict, error_response
@@ -312,6 +316,7 @@ def config():
             "showChatHistoryBrowser": current_app.config[CONFIG_CHAT_HISTORY_BROWSER_ENABLED],
             "showChatHistoryCosmos": current_app.config[CONFIG_CHAT_HISTORY_COSMOS_ENABLED],
             "showAgenticRetrievalOption": current_app.config[CONFIG_AGENTIC_RETRIEVAL_ENABLED],
+            "sharePointBaseUrl": current_app.config.get(CONFIG_SHAREPOINT_BASE_URL, "https://lumston.sharepoint.com/sites/AIBotProjectAutomation"),
         }
     )
 
@@ -542,7 +547,7 @@ async def debug_pilot_query():
             # También probar la búsqueda en SharePoint si es relacionada con pilotos
             sharepoint_results = []
             if is_pilot_related:
-                sharepoint_results = await chat_approach._search_sharepoint_files(query, top=15)
+                sharepoint_results = await chat_approach._search_sharepoint_files(query, top=1)
 
             return jsonify(
                 {
@@ -568,6 +573,240 @@ async def debug_pilot_query():
 async def debug_page():
     """Página de debug para probar funcionalidad de SharePoint"""
     return await send_from_directory("../frontend", "debug-sharepoint.html")
+
+
+@bp.route("/debug/managed-identity", methods=["GET"])
+async def debug_managed_identity():
+    """Endpoint para diagnosticar el Managed Identity desde el Container App"""
+    try:
+        from azure.identity.aio import ManagedIdentityCredential
+        from azure.core.exceptions import ClientAuthenticationError
+        
+        # Función auxiliar para validar acceso
+        async def validate_mi_access(resource: str):
+            try:
+                credential = ManagedIdentityCredential()
+                token = await credential.get_token(resource)
+                return {
+                    "resource": resource,
+                    "status": "success",
+                    "token_length": len(token.token) if token.token else 0,
+                    "expires_on": token.expires_on if hasattr(token, 'expires_on') else None
+                }
+            except ClientAuthenticationError as e:
+                return {
+                    "resource": resource,
+                    "status": "auth_error",
+                    "error": str(e)
+                }
+            except Exception as e:
+                return {
+                    "resource": resource,
+                    "status": "error",
+                    "error": str(e)
+                }
+        
+        # Recursos a probar
+        resources_to_test = [
+            "https://search.azure.com/",  # Azure Search scope
+            "https://management.azure.com/",  # Azure Management scope
+            "https://cognitiveservices.azure.com/",  # Cognitive Services
+        ]
+        
+        results = []
+        for resource in resources_to_test:
+            result = await validate_mi_access(resource)
+            results.append(result)
+        
+        # Información adicional del entorno
+        env_info = {
+            "AZURE_CLIENT_ID": os.getenv("AZURE_CLIENT_ID", "No configurado"),
+            "RUNNING_IN_PRODUCTION": os.getenv("RUNNING_IN_PRODUCTION", "No configurado"),
+            "WEBSITE_HOSTNAME": os.getenv("WEBSITE_HOSTNAME", "No configurado"),
+            "MSI_ENDPOINT": os.getenv("MSI_ENDPOINT", "No configurado"),
+            "IDENTITY_ENDPOINT": os.getenv("IDENTITY_ENDPOINT", "No configurado"),
+        }
+        
+        return jsonify({
+            "status": "success",
+            "managed_identity_tests": results,
+            "environment_info": env_info,
+            "summary": {
+                "total_tests": len(results),
+                "successful": len([r for r in results if r["status"] == "success"]),
+                "failed": len([r for r in results if r["status"] != "success"])
+            }
+        })
+        
+    except Exception as e:
+        current_app.logger.error(f"Error en debug de Managed Identity: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "message": "Error al validar Managed Identity"
+        }), 500
+
+
+@bp.route("/debug/search-validation", methods=["GET"])
+async def debug_search_validation():
+    """Endpoint para validar completamente el acceso a Azure Search"""
+    try:
+        from healthchecks.search import (
+            validate_search_environment_vars, 
+            validate_search_credential_scope, 
+            validate_search_access
+        )
+        
+        current_app.logger.info("🔍 Iniciando validación completa de Azure Search...")
+        
+        # Paso 1: Validar variables de entorno
+        env_check = validate_search_environment_vars()
+        if env_check["status"] == "error":
+            return jsonify({
+                "status": "error",
+                "step": "environment_variables",
+                "error": "Variables de entorno faltantes",
+                "details": env_check
+            }), 500
+        
+        # Paso 2: Obtener credencial actual
+        azure_credential = current_app.config[CONFIG_CREDENTIAL]
+        
+        # Paso 3: Validar scope de la credencial
+        current_app.logger.info("🔑 Validando scope de credencial...")
+        scope_valid = await validate_search_credential_scope(azure_credential)
+        
+        if not scope_valid:
+            return jsonify({
+                "status": "error",
+                "step": "credential_scope",
+                "error": "Credencial no puede obtener tokens para Azure Search",
+                "environment_check": env_check
+            }), 500
+        
+        # Paso 4: Validar acceso completo a Azure Search
+        endpoint = env_check["endpoint"]
+        index_name = env_check["required_vars"]["AZURE_SEARCH_INDEX"]
+        
+        current_app.logger.info(f"🌐 Validando acceso a {endpoint} con índice {index_name}...")
+        access_valid = await validate_search_access(endpoint, azure_credential, index_name)
+        
+        if access_valid:
+            return jsonify({
+                "status": "success",
+                "message": "✅ Todas las validaciones de Azure Search pasaron exitosamente",
+                "environment_check": env_check,
+                "credential_scope": "valid",
+                "search_access": "valid",
+                "recommendations": [
+                    "Azure Search está configurado correctamente",
+                    "Managed Identity tiene los permisos necesarios",
+                    "El endpoint y el índice son accesibles"
+                ]
+            })
+        else:
+            return jsonify({
+                "status": "error",
+                "step": "search_access",
+                "error": "No se pudo acceder a Azure Search",
+                "environment_check": env_check,
+                "credential_scope": "valid",
+                "search_access": "failed",
+                "recommendations": [
+                    "Verifica los roles RBAC en Azure Search",
+                    "Asegúrate que el Container App tenga System-Assigned Managed Identity",
+                    "Roles necesarios: Search Index Data Reader, Search Service Contributor, Search Index Data Contributor"
+                ]
+            }), 500
+        
+    except Exception as e:
+        current_app.logger.error(f"Error en validación de Azure Search: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "step": "unexpected_error",
+            "error": str(e),
+            "message": "Error inesperado durante la validación"
+        }), 500
+
+
+@bp.route("/debug/search-detailed", methods=["GET"])
+async def debug_search_detailed():
+    """Diagnóstico detallado de Azure Search ejecutando script especializado"""
+    import subprocess
+    import sys
+    import os
+    
+    try:
+        # Ejecutar el script de diagnóstico detallado
+        script_path = os.path.join(os.path.dirname(__file__), "debug_search_access.py")
+        
+        # Ejecutar el script y capturar output
+        result = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(__file__),
+            env=os.environ.copy(),
+            timeout=30  # 30 second timeout
+        )
+        
+        return jsonify({
+            "status": "completed",
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "diagnostic_summary": {
+                "rbac_validation": "✅" if "Estado RBAC: success" in result.stdout else "❌",
+                "credentials_test": "✅" if "✅ Token obtenido" in result.stdout else "❌",
+                "rest_api_test": "✅" if "✅ Acceso exitoso a Azure Search" in result.stdout else "❌", 
+                "search_client_test": "✅" if "✅ SearchClient funcionando" in result.stdout else "❌"
+            }
+        })
+        
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "status": "timeout",
+            "error": "El diagnóstico excedió el tiempo límite de 30 segundos"
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        })
+
+
+@bp.route("/debug/rbac-status", methods=["GET"])
+async def debug_rbac_status():
+    """Endpoint específico para consultar el estado RBAC de Azure Search"""
+    try:
+        from healthchecks.rbac_validation import get_rbac_status_dict
+        
+        # Obtener estado RBAC
+        rbac_status = await get_rbac_status_dict()
+        
+        return jsonify({
+            "status": "success",
+            "timestamp": datetime.now().isoformat(),
+            "rbac_status": rbac_status,
+            "recommendations": [] if rbac_status.get("rbac_validation") == "success" else [
+                "Verifica que el Managed Identity del Container App tenga los roles necesarios",
+                "Roles requeridos: Search Index Data Reader, Search Index Data Contributor, Search Service Contributor",
+                "Usa Azure Portal > Azure Search > Access Control (IAM) para asignar roles"
+            ]
+        })
+        
+    except ImportError:
+        return jsonify({
+            "status": "error",
+            "error": "Módulo rbac_validation no disponible",
+            "solution": "Asegúrate de que healthchecks/rbac_validation.py esté en el contenedor"
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        })
 
 
 @bp.route("/debug/sharepoint/explore", methods=["GET"])
@@ -650,7 +889,7 @@ async def debug_sharepoint_search_folders():
         from core.graph import GraphClient
 
         graph_client = GraphClient()
-        site_url = request.args.get('site_url', 'https://lumston.sharepoint.com/sites/Softwareengineering/')
+        site_url = request.args.get('site_url', 'https://lumston.sharepoint.com/sites/AIBotProjectAutomation/')
         search_term = request.args.get('search_term', 'volaris')
         
         # Buscar el sitio por URL
@@ -709,7 +948,7 @@ async def debug_sharepoint_library():
         from core.graph import GraphClient
 
         graph_client = GraphClient()
-        site_url = "https://lumston.sharepoint.com/sites/Softwareengineering/"
+        site_url = "https://lumston.sharepoint.com/sites/AIBotProjectAutomation/"
         
         # Buscar el sitio por URL
         site = graph_client.find_site_by_url(site_url)
@@ -770,7 +1009,7 @@ async def debug_sharepoint_search():
         from core.graph import GraphClient
 
         graph_client = GraphClient()
-        site_url = "https://lumston.sharepoint.com/sites/Softwareengineering/"
+        site_url = "https://lumston.sharepoint.com/sites/AIBotProjectAutomation/"
         search_query = request.args.get('query', 'pilotos')
         
         # Buscar el sitio por URL
@@ -989,6 +1228,113 @@ async def debug_find_specific_file():
         }), 500
 
 
+@bp.route("/health/full-checklist", methods=["GET"])
+async def health_full_checklist():
+    """
+    Endpoint de health check que ejecuta el checklist completo
+    Se autoejecuta en Container Apps como health probe
+    """
+    try:
+        import sys
+        import os
+        from io import StringIO
+        
+        # Capturar output del checklist
+        old_stdout = sys.stdout
+        sys.stdout = captured_output = StringIO()
+        
+        try:
+            # Importar y ejecutar el checklist simple para contexto web
+            sys.path.append(os.path.dirname(__file__))
+            
+            # Usar el deployment_checklist completo que incluye RBAC
+            try:
+                from diagnostics.deployment_checklist import run_checklist
+                from simple_checklist import load_env_file
+                
+                # Cargar variables de entorno
+                load_env_file()
+                
+                # Ejecutar checklist completo incluyendo RBAC
+                exit_code = run_checklist(['env', 'search', 'openai', 'rbac'])
+                
+                all_ok = (exit_code == 0)
+            except Exception as e:
+                print(f"❌ Error al ejecutar checklist completo: {e}")
+                print("🔄 Fallback a checklist simple...")
+                
+                # Fallback al checklist simple
+                from simple_checklist import (
+                    load_env_file,
+                    simple_check_azure_cli, 
+                    simple_check_search, 
+                    simple_check_openai
+                )
+                
+                # Cargar variables de entorno
+                load_env_file()
+                
+                print("🚀 Health Check (Fallback)")
+                print("=" * 40)
+                
+                cli_ok = simple_check_azure_cli()
+                search_ok = simple_check_search()
+                openai_ok = simple_check_openai()
+                
+                print("\n📋 RESUMEN:")
+                print(f"   ENV: {'✅' if cli_ok else '❌'}")
+                print(f"   SEARCH: {'✅' if search_ok else '❌'}")
+                print(f"   OPENAI: {'✅' if openai_ok else '❌'}")
+                print(f"   RBAC: ⚠️ Error en validación: {str(e)}")
+                
+                all_ok = all([cli_ok, search_ok, openai_ok])
+                exit_code = 1  # Forzar error debido a falla en RBAC
+            
+        finally:
+            sys.stdout = old_stdout
+        
+        output = captured_output.getvalue()
+        
+        # Determinar estado
+        if exit_code == 0:
+            status = "healthy"
+            http_status = 200
+        else:
+            status = "unhealthy" 
+            http_status = 503  # Service Unavailable
+        
+        return jsonify({
+            "status": status,
+            "exit_code": exit_code,
+            "timestamp": datetime.utcnow().isoformat(),
+            "environment": "container-app" if os.getenv("RUNNING_IN_PRODUCTION") else "development",
+            "detailed_output": output,
+            "summary": {
+                "environment_check": "✅" if "ENV: ✅" in output else "❌",
+                "search_check": "✅" if "SEARCH: ✅" in output else "❌", 
+                "openai_check": "✅" if "OPENAI: ✅" in output else "❌",
+                "rbac_check": "✅" if "RBAC: ✅" in output else ("⚠️" if "RBAC: ⚠️" in output else "❌")
+            }
+        }), http_status
+        
+    except Exception as e:
+        current_app.logger.error(f"Error en health_full_checklist: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }), 500
+
+@bp.route("/health", methods=["GET"])
+async def health_simple():
+    """Health check simple para Container Apps"""
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "version": "1.0.0"
+    }), 200
+
+
 @bp.before_app_serving
 async def setup_clients():
     # Replace these with your own values, either in environment variables or directly here
@@ -1057,34 +1403,26 @@ async def setup_clients():
     USE_CHAT_HISTORY_BROWSER = os.getenv("USE_CHAT_HISTORY_BROWSER", "").lower() == "true"
     USE_CHAT_HISTORY_COSMOS = os.getenv("USE_CHAT_HISTORY_COSMOS", "").lower() == "true"
     USE_AGENTIC_RETRIEVAL = os.getenv("USE_AGENTIC_RETRIEVAL", "").lower() == "true"
+    SHAREPOINT_BASE_URL = os.getenv("SHAREPOINT_BASE_URL", "https://lumston.sharepoint.com/sites/AIBotProjectAutomation")
 
     # WEBSITE_HOSTNAME is always set by App Service, RUNNING_IN_PRODUCTION is set in main.bicep
     RUNNING_ON_AZURE = os.getenv("WEBSITE_HOSTNAME") is not None or os.getenv("RUNNING_IN_PRODUCTION") is not None
 
-    # Use the current user identity for keyless authentication to Azure services.
-    # This assumes you use 'azd auth login' locally, and managed identity when deployed on Azure.
-    # The managed identity is setup in the infra/ folder.
-    azure_credential: Union[AzureDeveloperCliCredential, ManagedIdentityCredential]
-    if RUNNING_ON_AZURE:
-        current_app.logger.info("Setting up Azure credential using ManagedIdentityCredential")
-        if AZURE_CLIENT_ID := os.getenv("AZURE_CLIENT_ID"):
-            # ManagedIdentityCredential should use AZURE_CLIENT_ID if set in env, but its not working for some reason,
-            # so we explicitly pass it in as the client ID here. This is necessary for user-assigned managed identities.
-            current_app.logger.info(
-                "Setting up Azure credential using ManagedIdentityCredential with client_id %s", AZURE_CLIENT_ID
-            )
-            azure_credential = ManagedIdentityCredential(client_id=AZURE_CLIENT_ID)
-        else:
-            current_app.logger.info("Setting up Azure credential using ManagedIdentityCredential")
-            azure_credential = ManagedIdentityCredential()
-    elif AZURE_TENANT_ID:
-        current_app.logger.info(
-            "Setting up Azure credential using AzureDeveloperCliCredential with tenant_id %s", AZURE_TENANT_ID
-        )
-        azure_credential = AzureDeveloperCliCredential(tenant_id=AZURE_TENANT_ID, process_timeout=60)
-    else:
-        current_app.logger.info("Setting up Azure credential using AzureDeveloperCliCredential for home tenant")
-        azure_credential = AzureDeveloperCliCredential(process_timeout=60)
+    # Use our custom credential provider for robust authentication
+    # This automatically selects ClientSecretCredential for local dev or ManagedIdentity for Azure
+    from core.azure_credential import get_azure_credential_async, validate_azure_credentials
+    
+    # Validar configuración para debugging
+    current_app.logger.info("🔍 Iniciando validación de credenciales de Azure...")
+    validate_azure_credentials()
+    
+    # Obtener la credencial correcta para el entorno
+    try:
+        azure_credential = get_azure_credential_async()
+        current_app.logger.info(f"✅ Credencial configurada: {type(azure_credential).__name__}")
+    except Exception as e:
+        current_app.logger.error(f"💥 Error configurando credencial de Azure: {str(e)}")
+        raise
 
     # Set the Azure credential in the app config for use in other parts of the app
     current_app.config[CONFIG_CREDENTIAL] = azure_credential
@@ -1095,6 +1433,44 @@ async def setup_clients():
         index_name=AZURE_SEARCH_INDEX,
         credential=azure_credential,
     )
+    
+    # Validación opcional de Azure Search si está habilitada
+    if os.getenv("AZURE_VALIDATE_SEARCH", "").lower() == "true":
+        current_app.logger.info("🔍 AZURE_VALIDATE_SEARCH=true, ejecutando validaciones de Azure Search...")
+        try:
+            from healthchecks.search import (
+                validate_search_environment_vars, 
+                validate_search_credential_scope, 
+                validate_search_access
+            )
+            
+            # Validar variables de entorno
+            env_check = validate_search_environment_vars()
+            if env_check["status"] == "error":
+                current_app.logger.error("❌ Error en variables de entorno de Azure Search")
+                raise ValueError(f"Variables de entorno faltantes: {env_check['missing_required']}")
+            
+            # Validar scope de credencial
+            scope_valid = await validate_search_credential_scope(azure_credential)
+            if not scope_valid:
+                current_app.logger.error("❌ Credencial no puede obtener tokens para Azure Search")
+                raise ValueError("Credencial inválida para Azure Search")
+            
+            # Validar acceso completo
+            access_valid = await validate_search_access(AZURE_SEARCH_ENDPOINT, azure_credential, AZURE_SEARCH_INDEX)
+            if not access_valid:
+                current_app.logger.error("❌ No se pudo validar acceso a Azure Search")
+                raise ValueError("Acceso a Azure Search falló")
+                
+            current_app.logger.info("✅ Validaciones de Azure Search completadas exitosamente")
+            
+        except Exception as e:
+            current_app.logger.error(f"💥 Error crítico en validación de Azure Search: {str(e)}")
+            if os.getenv("AZURE_STRICT_VALIDATION", "").lower() == "true":
+                raise  # Fallar completamente si strict mode está habilitado
+            else:
+                current_app.logger.warning("⚠️ Continuando a pesar del error de validación (AZURE_STRICT_VALIDATION no está habilitado)")
+    
     agent_client = KnowledgeAgentRetrievalClient(
         endpoint=AZURE_SEARCH_ENDPOINT, agent_name=AZURE_SEARCH_AGENT, credential=azure_credential
     )
@@ -1251,6 +1627,7 @@ async def setup_clients():
     current_app.config[CONFIG_CHAT_HISTORY_BROWSER_ENABLED] = USE_CHAT_HISTORY_BROWSER
     current_app.config[CONFIG_CHAT_HISTORY_COSMOS_ENABLED] = USE_CHAT_HISTORY_COSMOS
     current_app.config[CONFIG_AGENTIC_RETRIEVAL_ENABLED] = USE_AGENTIC_RETRIEVAL
+    current_app.config[CONFIG_SHAREPOINT_BASE_URL] = SHAREPOINT_BASE_URL
 
     prompt_manager = PromptyManager()
 
@@ -1403,3 +1780,16 @@ def create_app():
             cors(app, allow_origin=allowed_origins, allow_methods=["GET", "POST"])
 
     return app
+
+if __name__ == "__main__":
+    # Validar entorno antes de iniciar el bot
+    try:
+        init_bot_context()
+        print("🎯 Iniciando validación de runtime...")
+        # validate_runtime_status() se ejecutará después de que la app esté corriendo
+    except Exception as e:
+        print(f"🛑 Error crítico en inicialización: {e}")
+        exit(1)
+    
+    app = create_app()
+    app.run(debug=True)

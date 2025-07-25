@@ -134,7 +134,7 @@ class ChatReadRetrieveReadApproach(ChatApproach):
         use_semantic_ranker = True if overrides.get("semantic_ranker") else False
         use_semantic_captions = True if overrides.get("semantic_captions") else False
         use_query_rewriting = True if overrides.get("query_rewriting") else False
-        top = overrides.get("top", 15)
+        top = overrides.get("top", 1)
         minimum_search_score = overrides.get("minimum_search_score", 0.0)
         minimum_reranker_score = overrides.get("minimum_reranker_score", 0.0)
         search_index_filter = self.build_filter(overrides, auth_claims)
@@ -249,7 +249,7 @@ class ChatReadRetrieveReadApproach(ChatApproach):
     ):
         minimum_reranker_score = overrides.get("minimum_reranker_score", 0)
         search_index_filter = self.build_filter(overrides, auth_claims)
-        top = overrides.get("top", 15)
+        top = overrides.get("top", 1)
         max_subqueries = overrides.get("max_subqueries", 10)
         results_merge_strategy = overrides.get("results_merge_strategy", "interleaved")
         # 50 is the amount of documents that the reranker can process per query
@@ -428,9 +428,21 @@ class ChatReadRetrieveReadApproach(ChatApproach):
         
         # Agregar resultados de SharePoint en el formato esperado (string con citación)
         for result in sharepoint_results:
-            citation = result['source']
+            # Usar la URL real de SharePoint si está disponible, sino usar el source como fallback
+            citation_url = result.get('url', '') or result['source']
+            
+            # Si tenemos una URL real de SharePoint, usarla; sino usar el formato original
+            if citation_url and citation_url.startswith('http'):
+                # Usar la URL real de SharePoint como citación
+                citation = citation_url
+            else:
+                # Fallback al formato original si no hay URL
+                citation = result['source']
+            
             content = result['content'].replace("\n", " ").replace("\r", " ")
             combined_sources.append(f"{citation}: {content}")
+            
+            print(f"DEBUG: SharePoint citation - URL: {citation_url}, Citation: {citation}")
         
         return combined_sources
 
